@@ -1,0 +1,167 @@
+const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
+const fs = require('fs');
+const sharp = require('sharp');
+const { promisify } = require('util');
+const writeFileAsync = promisify(fs.writeFile);
+const unlinkAsync = promisify(fs.unlink);
+
+// Replace with your own Telegram Bot Token and Chat ID
+const TELEGRAM_BOT_TOKEN = 'TOKEN';
+const TELEGRAM_CHAT_ID = 'CHAT_ID';
+
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+
+async function getActualImageUrl(instagramUrl) {
+    console.log(`Processing Instagram URL: ${instagramUrl}`);
+    const modifiedUrl = instagramUrl.replace(/\/?$/, '/media/?size=l');
+    console.log(`Modified URL: ${modifiedUrl}`);
+
+    try {
+        const response = await axios.get(modifiedUrl, {
+            maxRedirects: 0,
+            validateStatus: null
+        });
+
+        if (response.status === 302 && response.headers.location) {
+            console.log(`Actual image URL: ${response.headers.location}`);
+            return response.headers.location;
+        } else {
+            throw new Error('Failed to get the actual image URL');
+        }
+    } catch (error) {
+        console.error(`Error getting actual image URL: ${error.message}`);
+        throw error;
+    }
+}
+
+async function downloadImage(url) {
+    try {
+        console.log(`Attempting to download image from ${url}`);
+        const response = await axios({
+            url,
+            method: 'GET',
+            responseType: 'arraybuffer',
+            timeout: 10000,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+        });
+        console.log(`Image downloaded. Content-Type: ${response.headers['content-type']}`);
+        return response.data;
+    } catch (error) {
+        console.error(`Error downloading image: ${error.message}`);
+        throw error;
+    }
+}
+
+async function addTextOverlay(imageBuffer) {
+    try {
+        const width = 1080;
+        const height = 1080;
+        const svgText = `
+        <svg width="${width}" height="${height}">
+            <style>
+                .title { fill: yellow; font-size: 60px; font-weight: bold; font-family: Arial, sans-serif; }
+                .subtitle { fill: yellow; font-size: 50px; font-family: Arial, sans-serif; }
+                .link { fill: yellow; font-size: 30px; font-family: Arial, sans-serif; }
+            </style>
+            <defs>
+                <filter id="outline">
+                    <feMorphology in="SourceAlpha" result="DILATED" operator="dilate" radius="2"/>
+                    <feFlood flood-color="black" flood-opacity="1" result="BLACK"/>
+                    <feComposite in="BLACK" in2="DILATED" operator="in" result="OUTLINE"/>
+                    <feMerge>
+                        <feMergeNode in="OUTLINE"/>
+                        <feMergeNode in="SourceGraphic"/>
+                    </feMerge>
+                </filter>
+            </defs>
+            <g transform="translate(540,540) rotate(25) translate(-540,-540)">
+                <g filter="url(#outline)" transform="translate(0, 100)">
+                    <text x="50%" y="840" text-anchor="middle" class="title">Ahora al aire</text>
+                    <text x="50%" y="920" text-anchor="middle" class="subtitle">ON-AIR</text>
+                    <text x="50%" y="1000" text-anchor="middle" class="link">Escucha aquí > red.radiolibre.cc</text>
+                </g>
+            </g>
+        </svg>
+        `;
+
+        const svgBuffer = Buffer.from(svgText);
+
+        return sharp(imageBuffer)
+            .resize(1080, 1080, { fit: 'cover' })
+            .composite([{
+                input: svgBuffer,
+                top: 0,
+                left: 0,
+            }])
+            .jpeg()
+            .toBuffer();
+    } catch (error) {
+        console.error(`Error adding text overlay: ${error.message}`);
+        throw error;
+    }
+}
+
+async function sendToTelegram(instagramUrl) {
+    const filePath = `temp_${Date.now()}.jpg`;
+
+    try {
+        const actualImageUrl = await getActualImageUrl(instagramUrl);
+        const imageBuffer = await downloadImage(actualImageUrl);
+        const processedImageBuffer = await addTextOverlay(imageBuffer);
+
+        await writeFileAsync(filePath, processedImageBuffer);
+        console.log('Sending photo to Telegram...');
+        const result = await bot.sendPhoto(TELEGRAM_CHAT_ID, filePath);
+        console.log('Post sent successfully to Telegram.');
+        console.log('Telegram API response:', JSON.stringify(result));
+    } catch (error) {
+        console.error(`Error sending to Telegram: ${error.message}`);
+        if (error.response) {
+            console.error(`Telegram API error code: ${error.response.errorCode}`);
+            console.error(`Telegram API description: ${error.response.description}`);
+        }
+        throw error;
+    } finally {
+        try {
+            if (fs.existsSync(filePath)) {
+                await unlinkAsync(filePath);
+                console.log('Temporary image file deleted.');
+            }
+        } catch (unlinkError) {
+            console.error(`Error deleting temporary file: ${unlinkError.message}`);
+        }
+    }
+}
+
+function main() {
+    bot.onText(/\/start/, async (msg) => {
+        const chatId = msg.chat.id;
+        console.log(`Received /start command from chat ${chatId}`);
+        await bot.sendMessage(chatId, "Bot started. Use /post to send an Instagram post to Telegram.");
+    });
+
+    bot.onText(/\/post/, async (msg) => {
+        const chatId = msg.chat.id;
+        await bot.sendMessage(chatId, "Please send the Instagram post URL.");
+        bot.once('text', async (urlMsg) => {
+            const postUrl = urlMsg.text;
+            try {
+                await sendToTelegram(postUrl);
+                await bot.sendMessage(chatId, "Post successfully sent to Telegram!");
+            } catch (error) {
+                await bot.sendMessage(chatId, `Error sending post: ${error.message}`);
+            }
+        });
+    });
+
+    bot.on('polling_error', (error) => {
+        console.error('Polling error:', error);
+    });
+
+    console.log('Bot is running...');
+}
+
+main();
